@@ -1,17 +1,14 @@
 {
   "name": "free-signup-cloudrun-api-ihudson",
-  "version": "1.0.0",
+  "type": "module",
   "main": "index.js",
-  "type": "commonjs",
-  "engines": {
-    "node": ">=18"
-  },
+  "engines": { "node": ">=20" },
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
     "express": "^4.19.2",
-    "firebase-admin": "^12.5.0",
+    "firebase-admin": "^12.2.0",
     "googleapis": "^140.0.0"
   }
 }
