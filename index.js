@@ -36,20 +36,92 @@ must("GOOGLE_ADMIN_SUBJECT", ENV.GOOGLE_ADMIN_SUBJECT);
 must("GOOGLE_GROUP_EMAIL", ENV.GOOGLE_GROUP_EMAIL);
 must("TURNSTILE_SECRET", ENV.TURNSTILE_SECRET);
 
+// ---------- Email validation / typo suggestion (same logic) ----------
+const EMAIL_REGEX =
+  /^(?!.*\.\.)[A-Za-z0-9_%+-](?:[A-Za-z0-9._%+-]*[A-Za-z0-9_%+-])?@(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}$/;
+
+const DOMAIN_TYPO_MAP = {
+  // Gmail
+  "gmal.com": "gmail.com",
+  "gmal.con": "gmail.com",
+  "gmial.com": "gmail.com",
+  "gmial.con": "gmail.com",
+  "gmai.com": "gmail.com",
+  "gmai.con": "gmail.com",
+  "gmail.con": "gmail.com",
+  "gmail.cmo": "gmail.com",
+  "gmail.om": "gmail.com",
+
+  // Hotmail / Outlook
+  "hotmial.com": "hotmail.com",
+  "hotmail.con": "hotmail.com",
+  "hotmail.cmo": "hotmail.com",
+  "hotmail.om": "hotmail.com",
+
+  "outlok.com": "outlook.com",
+  "outlok.con": "outlook.com",
+  "outlook.con": "outlook.com",
+  "outlook.cmo": "outlook.com",
+  "outlook.om": "outlook.com",
+
+  // Naver
+  "naver.con": "naver.com",
+  "naver.cmo": "naver.com",
+  "naver.om": "naver.com",
+};
+
+const TLD_TYPO_HINTS = [
+  { bad: ".con", suggest: ".com" },
+  { bad: ".cmo", suggest: ".com" },
+  { bad: ".om", suggest: ".com" },
+  { bad: ".ne", suggest: ".net" },
+  { bad: ".orq", suggest: ".org" },
+];
+
+function splitEmail(v) {
+  const s = String(v || "").trim();
+  const at = s.lastIndexOf("@");
+  if (at <= 0 || at === s.length - 1) return null;
+  return { local: s.slice(0, at), domain: s.slice(at + 1) };
+}
+function endsWithIgnoreCase(str, suffix) {
+  return String(str || "").toLowerCase().endsWith(String(suffix || "").toLowerCase());
+}
+function guessTypoSuggestion(emailRaw) {
+  const v = String(emailRaw || "").trim();
+  const parts = splitEmail(v);
+  if (!parts) return null;
+
+  const local = parts.local; // keep typed
+  const domain = String(parts.domain || "").toLowerCase();
+
+  if (DOMAIN_TYPO_MAP[domain]) {
+    return `${local}@${DOMAIN_TYPO_MAP[domain]}`;
+  }
+
+  for (const rule of TLD_TYPO_HINTS) {
+    if (endsWithIgnoreCase(domain, rule.bad)) {
+      const base = domain.slice(0, -rule.bad.length);
+      if (!base || base.endsWith(".")) continue;
+      return `${local}@${base + rule.suggest}`;
+    }
+  }
+  return null;
+}
+
+function normalizeEmailStrict(raw) {
+  const email = String(raw || "").trim();
+  if (!EMAIL_REGEX.test(email)) return null;
+  return email.toLowerCase();
+}
+
 // ---------- Helpers ----------
 function stripOuterQuotes(s) {
   const t = String(s ?? "").trim();
-  // "admin@calvestor.com" / 'admin@calvestor.com' 같은 실수를 자동 복구
   if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {
     return t.slice(1, -1).trim();
   }
   return t;
-}
-
-function normalizeEmail(raw) {
-  const email = String(raw || "").trim().toLowerCase();
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return null;
-  return email;
 }
 
 function getClientIp(req) {
@@ -64,7 +136,6 @@ const allowedSet = new Set(ENV.ALLOWED_ORIGINS);
 function applyCors(req, res) {
   const origin = req.headers.origin;
 
-  // allowlist를 지정했으면 allowlist만 허용
   if (origin && allowedSet.size > 0) {
     if (allowedSet.has(origin)) {
       res.setHeader("Access-Control-Allow-Origin", origin);
@@ -72,7 +143,6 @@ function applyCors(req, res) {
     }
   }
 
-  // allowlist가 비어있으면(설정 실수 방지용) 일단 전체 허용
   if (origin && allowedSet.size === 0) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
@@ -140,7 +210,6 @@ async function getDirectoryClient() {
   const sa = JSON.parse(ENV.GOOGLE_SA_JSON);
 
   const subject = stripOuterQuotes(ENV.GOOGLE_ADMIN_SUBJECT);
-  // 여기서 subject가 잘못되면 너 로그처럼 "Invalid impersonation sub"로 터짐
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(subject)) {
     throw new Error(`BAD_GOOGLE_ADMIN_SUBJECT:${subject}`);
   }
@@ -155,7 +224,6 @@ async function getDirectoryClient() {
   try {
     await jwt.authorize();
   } catch (e) {
-    // 디버깅용으로 Google 응답을 최대한 보여주되, 민감정보는 안 찍음
     const status = e?.response?.status;
     const data = e?.response?.data;
     console.error("GOOGLE_AUTH_FAILED", { status, data, message: String(e?.message || "") });
@@ -189,9 +257,17 @@ app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.post("/api/free-signup", async (req, res) => {
   const ip = getClientIp(req);
-  const email = normalizeEmail(req.body?.email);
+
+  const emailRaw = String(req.body?.email || "").trim();
   const token = String(req.body?.turnstileToken || "");
 
+  // ✅ server-side typo suggestion block (same logic)
+  const suggestion = guessTypoSuggestion(emailRaw);
+  if (suggestion && suggestion.toLowerCase() !== emailRaw.toLowerCase()) {
+    return res.status(400).json({ ok: false, code: "EMAIL_TYPO_SUGGEST", suggestion });
+  }
+
+  const email = normalizeEmailStrict(emailRaw);
   if (!email) return res.status(400).json({ ok: false, code: "INVALID_EMAIL" });
   if (!token) return res.status(400).json({ ok: false, code: "MISSING_CAPTCHA" });
 
