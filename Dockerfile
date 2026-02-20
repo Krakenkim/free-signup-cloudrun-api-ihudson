@@ -5,4 +5,4 @@ RUN npm install --omit=dev
 COPY index.js ./
 ENV PORT=8080
 EXPOSE 8080
-CMD ["npm", "start"]
+CMD ["node", "index.js"]
