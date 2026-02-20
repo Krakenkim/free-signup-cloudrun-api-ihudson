@@ -39,14 +39,13 @@ must("TURNSTILE_SECRET", ENV.TURNSTILE_SECRET);
 // ---------- Helpers ----------
 function stripOuterQuotes(s) {
   const t = String(s ?? "").trim();
-  // "admin@calvestor.com" / 'admin@calvestor.com' 같은 실수를 자동 복구
   if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {
     return t.slice(1, -1).trim();
   }
   return t;
 }
 
-// ✅ 프론트(네가 준 스크립트)와 동일 레벨의 엄격한 이메일 정규식
+// ✅ 프론트와 동일 레벨의 엄격한 이메일 정규식
 const EMAIL_REGEX =
   /^(?!.*\.\.)[A-Za-z0-9_%+-](?:[A-Za-z0-9._%+-]*[A-Za-z0-9_%+-])?@(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}$/;
 
@@ -62,13 +61,17 @@ function getClientIp(req) {
   return req.ip;
 }
 
-// ---------- CORS (전역 / 옵션 포함) ----------
+function isGmailAddress(email) {
+  const e = String(email || "").toLowerCase();
+  return e.endsWith("@gmail.com") || e.endsWith("@googlemail.com");
+}
+
+// ---------- CORS ----------
 const allowedSet = new Set(ENV.ALLOWED_ORIGINS);
 
 function applyCors(req, res) {
   const origin = req.headers.origin;
 
-  // allowlist를 지정했으면 allowlist만 허용
   if (origin && allowedSet.size > 0) {
     if (allowedSet.has(origin)) {
       res.setHeader("Access-Control-Allow-Origin", origin);
@@ -76,7 +79,6 @@ function applyCors(req, res) {
     }
   }
 
-  // allowlist가 비어있으면(설정 실수 방지용) 일단 전체 허용
   if (origin && allowedSet.size === 0) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
@@ -144,7 +146,6 @@ async function getDirectoryClient() {
   const sa = JSON.parse(ENV.GOOGLE_SA_JSON);
 
   const subject = stripOuterQuotes(ENV.GOOGLE_ADMIN_SUBJECT);
-  // 여기서 subject가 잘못되면 "Invalid impersonation sub"로 터짐
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(subject)) {
     throw new Error(`BAD_GOOGLE_ADMIN_SUBJECT:${subject}`);
   }
@@ -170,6 +171,7 @@ async function getDirectoryClient() {
 
 async function addToGroup(email) {
   const directory = await getDirectoryClient();
+
   try {
     await directory.members.insert({
       groupKey: ENV.GOOGLE_GROUP_EMAIL,
@@ -177,12 +179,28 @@ async function addToGroup(email) {
     });
     return { added: true };
   } catch (e) {
-    const code = e?.code;
+    const code = e?.code; // usually HTTP status
     const msg = String(e?.message || "");
+
+    // already exists
     if (code === 409 || msg.includes("Member already exists") || msg.includes("duplicate")) {
       return { added: false, already: true };
     }
-    console.error("DIRECTORY_ERROR", { code, msg });
+
+    // ✅ 핵심: "없는 Gmail"은 404(Resource Not Found: <email>)로 떨어짐
+    // - 외부 도메인(네이버/아웃룩 등)은 초대 방식이라 대부분 404가 안 뜸
+    // - 404가 떠도 "email"이 메시지에 포함된 경우만 잡는다 (그룹 자체 404와 구분)
+    if (
+      code === 404 &&
+      isGmailAddress(email) &&
+      msg.toLowerCase().includes("resource not found") &&
+      msg.toLowerCase().includes(String(email).toLowerCase())
+    ) {
+      console.warn("EMAIL_NOT_FOUND_GMAIL", { email, code, msg });
+      throw new Error("EMAIL_NOT_FOUND");
+    }
+
+    console.error("DIRECTORY_ERROR", { code, msg, email });
     throw new Error("DIRECTORY_ERROR");
   }
 }
@@ -214,6 +232,12 @@ app.post("/api/free-signup", async (req, res) => {
 
     if (m === "RATE_IP") return res.status(429).json({ ok: false, code: "RATE_IP" });
     if (m === "RATE_EMAIL") return res.status(429).json({ ok: false, code: "RATE_EMAIL" });
+
+    // ✅ 없는 Gmail 전용 코드
+    if (m === "EMAIL_NOT_FOUND") {
+      return res.status(404).json({ ok: false, code: "EMAIL_NOT_FOUND" });
+    }
+
     if (m.startsWith("BAD_GOOGLE_ADMIN_SUBJECT:")) {
       return res.status(500).json({ ok: false, code: "BAD_GOOGLE_ADMIN_SUBJECT" });
     }
