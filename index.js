@@ -1,191 +1,178 @@
-"use strict";
+// index.js (Node 20+ / ESM)
+import express from "express";
+import { google } from "googleapis";
+import admin from "firebase-admin";
 
-const express = require("express");
-const admin = require("firebase-admin");
-const { google } = require("googleapis");
+const app = express();
+app.disable("x-powered-by");
 
 // --------------------
 // ENV
 // --------------------
-function mustEnv(name) {
-  const v = process.env[name];
-  if (!v || String(v).trim() === "") throw new Error(`Missing env: ${name}`);
-  return v;
-}
-
 const ENV = {
-  PORT: Number(process.env.PORT || 8080),
+  GOOGLE_SA_JSON: process.env.GOOGLE_SA_JSON,
+  GOOGLE_ADMIN_SUBJECT: process.env.GOOGLE_ADMIN_SUBJECT,
+  GOOGLE_GROUP_EMAIL: process.env.GOOGLE_GROUP_EMAIL, // free-subs@calvestor.com
+  TURNSTILE_SECRET: process.env.TURNSTILE_SECRET,
 
-  // ✅ CORS 허용할 워드프레스 도메인들 (쉼표로 여러개)
-  // 기본값: 네 콘솔에 찍힌 origin 포함
+  // ✅ CORS 허용 목록 (비어있으면 기본값 사용)
+  // Cloud Run 콘솔에서 ALLOWED_ORIGINS를 따로 안 넣어도 동작하도록 기본값을 넣어둠
   ALLOWED_ORIGINS: (process.env.ALLOWED_ORIGINS ||
-    "https://ihudson.mycafe24.com,https://calvestor.com,https://www.calvestor.com,http://localhost:3000"
-  )
+    "https://ihudson.mycafe24.com,https://calvestor.com,https://www.calvestor.com")
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean),
 
-  // Turnstile
-  TURNSTILE_SECRET: mustEnv("TURNSTILE_SECRET"),
-
-  // Google Groups 추가용 (DWD 서비스계정 JSON)
-  GOOGLE_SA_JSON: mustEnv("GOOGLE_SA_JSON"),
-  GOOGLE_ADMIN_EMAIL: mustEnv("GOOGLE_ADMIN_EMAIL"),
-  FREE_GROUP_EMAIL: process.env.FREE_GROUP_EMAIL || "free-subs@calvestor.com",
-
-  // Rate limit (Firestore)
-  RATE_LIMIT_MAX: Number(process.env.RATE_LIMIT_MAX || 5), // window 안에서 최대 요청
-  RATE_LIMIT_WINDOW_SEC: Number(process.env.RATE_LIMIT_WINDOW_SEC || 600), // 10분
-  RATE_COLLECTION: process.env.RATE_COLLECTION || "free_signup_rate_limits",
+  // ✅ 레이트리밋
+  RATE_IP_PER_HOUR: Number(process.env.RATE_IP_PER_HOUR || 20),
+  RATE_EMAIL_PER_DAY: Number(process.env.RATE_EMAIL_PER_DAY || 3),
 };
 
-// --------------------
-// App
-// --------------------
-const app = express();
+function must(name, v) {
+  if (!v || String(v).trim() === "") throw new Error(`Missing env: ${name}`);
+}
+must("GOOGLE_SA_JSON", ENV.GOOGLE_SA_JSON);
+must("GOOGLE_ADMIN_SUBJECT", ENV.GOOGLE_ADMIN_SUBJECT);
+must("GOOGLE_GROUP_EMAIL", ENV.GOOGLE_GROUP_EMAIL);
+must("TURNSTILE_SECRET", ENV.TURNSTILE_SECRET);
 
-// ✅ 1) CORS + Preflight(OPTIONS) 처리 (가장 위에 있어야 함)
-const ALLOWED = new Set(ENV.ALLOWED_ORIGINS);
+// --------------------
+// ✅ CORS (핵심 수정)
+// --------------------
+const ALLOWED_ORIGIN_SET = new Set(ENV.ALLOWED_ORIGINS);
 
-app.use((req, res, next) => {
+function applyCors(req, res) {
   const origin = req.headers.origin;
 
-  // allowlist에 있는 origin만 허용
-  if (origin && ALLOWED.has(origin)) {
+  // allowlist에 있는 origin만 허용 (보안상 * 금지)
+  if (origin && ALLOWED_ORIGIN_SET.has(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
   }
 
-  // preflight에 필요한 헤더들
+  // preflight에 필수
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  res.setHeader("Access-Control-Max-Age", "86400");
+  res.setHeader("Access-Control-Max-Age", "3600");
+}
 
-  if (req.method === "OPTIONS") return res.status(204).end();
+// ✅ CORS를 라우트 안이 아니라 "전역 미들웨어"로 처리 (프리플라이트/에러에서도 헤더 유지)
+app.use((req, res, next) => {
+  applyCors(req, res);
+
+  // 브라우저가 먼저 보내는 OPTIONS(preflight)는 여기서 바로 끝내야 함
+  if (req.method === "OPTIONS") return res.status(204).send();
   next();
 });
 
-// JSON 바디
-app.use(express.json({ limit: "1mb" }));
+// JSON body는 CORS 다음에
+app.use(express.json({ limit: "200kb" }));
 
 // --------------------
-// Firestore init (rate limit)
+// Firestore init (Cloud Run 실행 서비스계정에 Firestore 권한 필요)
 // --------------------
-function initFirestoreIfNeeded() {
-  if (admin.apps.length > 0) return;
+if (!admin.apps.length) admin.initializeApp();
+const db = admin.firestore();
 
-  // GOOGLE_SA_JSON으로 Firestore까지 같이 초기화(같은 프로젝트라고 가정)
-  const sa = JSON.parse(ENV.GOOGLE_SA_JSON);
-  admin.initializeApp({
-    credential: admin.credential.cert(sa),
-  });
+// --------------------
+// Helpers
+// --------------------
+function normalizeEmail(raw) {
+  const email = String(raw || "").trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return null;
+  return email;
 }
 
 function getClientIp(req) {
   const xff = req.headers["x-forwarded-for"];
   if (xff) return String(xff).split(",")[0].trim();
-  return req.socket.remoteAddress || "unknown";
-}
-
-async function rateLimitOrThrow(req) {
-  initFirestoreIfNeeded();
-  const db = admin.firestore();
-
-  const ip = getClientIp(req);
-  const now = Date.now();
-  const windowSec = ENV.RATE_LIMIT_WINDOW_SEC;
-  const bucket = Math.floor(now / (windowSec * 1000)); // window 단위 버킷
-  const docId = `${ip}:${bucket}`;
-
-  const ref = db.collection(ENV.RATE_COLLECTION).doc(docId);
-
-  await db.runTransaction(async (tx) => {
-    const snap = await tx.get(ref);
-    const count = snap.exists ? Number(snap.data().count || 0) : 0;
-
-    if (count >= ENV.RATE_LIMIT_MAX) {
-      const err = new Error("RATE_LIMITED");
-      err.statusCode = 429;
-      throw err;
-    }
-
-    const expireAt = new Date(now + windowSec * 2 * 1000); // TTL용(대충 2배)
-    tx.set(
-      ref,
-      {
-        ip,
-        bucket,
-        count: count + 1,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        expireAt, // Firestore TTL 정책 걸면 자동 정리됨
-      },
-      { merge: true }
-    );
-  });
+  return req.ip;
 }
 
 // --------------------
 // Turnstile verify
 // --------------------
-async function verifyTurnstile({ token, remoteip }) {
-  const form = new URLSearchParams();
-  form.set("secret", ENV.TURNSTILE_SECRET);
-  form.set("response", token);
-  if (remoteip) form.set("remoteip", remoteip);
+async function verifyTurnstile(token, ip) {
+  const body = new URLSearchParams();
+  body.set("secret", ENV.TURNSTILE_SECRET);
+  body.set("response", token);
+  if (ip) body.set("remoteip", ip);
 
-  const resp = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+  const r = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: form.toString(),
+    body,
   });
 
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => "");
-    return { success: false, errorCodes: ["turnstile_http_error"], detail: text };
-  }
-  return resp.json();
+  // 혹시 Cloudflare 응답이 이상하면 안전하게 실패 처리
+  if (!r.ok) return false;
+
+  const data = await r.json().catch(() => null);
+  return !!data?.success;
 }
 
 // --------------------
-// Google Groups add member
+// ✅ rate limit (Firestore)
+// --------------------
+async function rateLimitOrThrow({ ip, email }) {
+  const now = new Date();
+  const hourKey = `${now.getUTCFullYear()}-${now.getUTCMonth() + 1}-${now.getUTCDate()}-${now.getUTCHours()}`;
+  const dayKey = `${now.getUTCFullYear()}-${now.getUTCMonth() + 1}-${now.getUTCDate()}`;
+
+  const ipDocId = `ip:${ip}:${hourKey}`;
+  const emDocId = `email:${email}:${dayKey}`;
+
+  const ipRef = db.collection("rate_limits").doc(ipDocId);
+  const emRef = db.collection("rate_limits").doc(emDocId);
+
+  await db.runTransaction(async (tx) => {
+    const [ipSnap, emSnap] = await Promise.all([tx.get(ipRef), tx.get(emRef)]);
+
+    const ipCount = (ipSnap.exists ? ipSnap.data().count || 0 : 0) + 1;
+    const emCount = (emSnap.exists ? emSnap.data().count || 0 : 0) + 1;
+
+    if (ipCount > ENV.RATE_IP_PER_HOUR) throw new Error("RATE_IP");
+    if (emCount > ENV.RATE_EMAIL_PER_DAY) throw new Error("RATE_EMAIL");
+
+    // TTL용 만료시간(나중에 Firestore TTL로 자동 삭제 가능)
+    const ttlIp = new Date(now.getTime() + 2 * 60 * 60 * 1000); // 2시간
+    const ttlEm = new Date(now.getTime() + 2 * 24 * 60 * 60 * 1000); // 2일
+
+    tx.set(ipRef, { count: ipCount, expireAt: ttlIp, ip }, { merge: true });
+    tx.set(emRef, { count: emCount, expireAt: ttlEm, email }, { merge: true });
+  });
+}
+
+// --------------------
+// Google Directory client
 // --------------------
 async function getDirectoryClient() {
   const sa = JSON.parse(ENV.GOOGLE_SA_JSON);
-  const scopes = ["https://www.googleapis.com/auth/admin.directory.group.member"];
-
-  const auth = new google.auth.JWT({
+  const jwt = new google.auth.JWT({
     email: sa.client_email,
     key: sa.private_key,
-    scopes,
-    subject: ENV.GOOGLE_ADMIN_EMAIL, // ✅ 도메인-wide delegation
+    scopes: ["https://www.googleapis.com/auth/admin.directory.group.member"],
+    subject: ENV.GOOGLE_ADMIN_SUBJECT,
   });
-
-  const directory = google.admin({ version: "directory_v1", auth });
-  return directory;
+  await jwt.authorize();
+  return google.admin({ version: "directory_v1", auth: jwt });
 }
 
-async function addMemberToGroup(email) {
+async function addToGroup(email) {
   const directory = await getDirectoryClient();
-
   try {
     await directory.members.insert({
-      groupKey: ENV.FREE_GROUP_EMAIL,
-      requestBody: {
-        email,
-        role: "MEMBER",
-      },
+      groupKey: ENV.GOOGLE_GROUP_EMAIL,
+      requestBody: { email, role: "MEMBER" },
     });
-    return { status: "added" };
+    return { added: true };
   } catch (e) {
-    const code = e?.code || e?.response?.status;
-    const msg = e?.message || "";
-
-    // 이미 멤버면 성공 취급
-    if (code === 409 || /Member already exists/i.test(msg)) {
-      return { status: "exists" };
+    const code = e?.code;
+    const msg = String(e?.message || "");
+    // 이미 멤버면 “이미 가입됨” 처리
+    if (code === 409 || msg.includes("Member already exists") || msg.includes("duplicate")) {
+      return { added: false, already: true };
     }
-
-    // 그대로 throw
     throw e;
   }
 }
@@ -196,67 +183,43 @@ async function addMemberToGroup(email) {
 app.get("/healthz", (req, res) => res.status(200).send("ok"));
 
 app.post("/api/free-signup", async (req, res) => {
+  const origin = req.headers.origin;
+
+  // ✅ 서버에서도 origin 체크 (CORS 우회 요청 방지)
+  if (origin && !ALLOWED_ORIGIN_SET.has(origin)) {
+    return res.status(403).json({ ok: false, code: "FORBIDDEN_ORIGIN", origin });
+  }
+
+  const ip = getClientIp(req);
+  const email = normalizeEmail(req.body?.email);
+  const token = String(req.body?.turnstileToken || "").trim();
+
+  if (!email) return res.status(400).json({ ok: false, code: "INVALID_EMAIL" });
+  if (!token) return res.status(400).json({ ok: false, code: "MISSING_CAPTCHA" });
+
   try {
-    // (선택) origin 체크를 서버에서도 한 번 더
-    const origin = req.headers.origin;
-    if (origin && !ALLOWED.has(origin)) {
-      return res.status(403).json({ ok: false, error: "FORBIDDEN_ORIGIN", origin });
-    }
+    // 1) 레이트리밋
+    await rateLimitOrThrow({ ip, email });
 
-    const emailRaw = (req.body?.email || "").toString().trim().toLowerCase();
-    const turnstileToken = (req.body?.turnstileToken || "").toString().trim();
+    // 2) 캡차
+    const human = await verifyTurnstile(token, ip);
+    if (!human) return res.status(403).json({ ok: false, code: "CAPTCHA_FAILED" });
 
-    if (!emailRaw) return res.status(400).json({ ok: false, error: "EMAIL_REQUIRED" });
-
-    // 아주 기본 이메일 체크
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailRaw)) {
-      return res.status(400).json({ ok: false, error: "EMAIL_INVALID" });
-    }
-
-    if (!turnstileToken) {
-      return res.status(400).json({ ok: false, error: "TURNSTILE_TOKEN_REQUIRED" });
-    }
-
-    // ✅ 레이트리밋(너무 많이 누르면 막기)
-    await rateLimitOrThrow(req);
-
-    // ✅ Turnstile 검증
-    const remoteip = getClientIp(req);
-    const result = await verifyTurnstile({ token: turnstileToken, remoteip });
-
-    if (!result?.success) {
-      return res.status(400).json({
-        ok: false,
-        error: "TURNSTILE_FAILED",
-        codes: result?.["error-codes"] || result?.errorCodes || [],
-      });
-    }
-
-    // ✅ Google Group 추가
-    const out = await addMemberToGroup(emailRaw);
-
-    return res.status(200).json({
-      ok: true,
-      email: emailRaw,
-      group: ENV.FREE_GROUP_EMAIL,
-      status: out.status,
-    });
+    // 3) 그룹 추가
+    const result = await addToGroup(email);
+    return res.json({ ok: true, result });
   } catch (e) {
-    const status = e?.statusCode || 500;
+    const m = String(e?.message || "");
+    if (m === "RATE_IP") return res.status(429).json({ ok: false, code: "RATE_IP" });
+    if (m === "RATE_EMAIL") return res.status(429).json({ ok: false, code: "RATE_EMAIL" });
 
-    if (e?.message === "RATE_LIMITED") {
-      return res.status(429).json({ ok: false, error: "RATE_LIMITED" });
-    }
-
-    console.error("[free-signup] error:", e);
-    return res.status(status).json({ ok: false, error: "SERVER_ERROR" });
+    console.error("free-signup error", e);
+    return res.status(500).json({ ok: false, code: "SERVER_ERROR" });
   }
 });
 
-// --------------------
-// Listen (Cloud Run은 PORT 필수)
-// --------------------
-app.listen(ENV.PORT, "0.0.0.0", () => {
-  console.log(`free-signup api listening on :${ENV.PORT}`);
-  console.log("allowed origins:", ENV.ALLOWED_ORIGINS);
+const port = process.env.PORT || 8080;
+app.listen(port, () => {
+  console.log(`Listening on ${port}`);
+  console.log("Allowed origins:", [...ALLOWED_ORIGIN_SET]);
 });
