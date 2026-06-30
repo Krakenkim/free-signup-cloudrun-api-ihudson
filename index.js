@@ -15,17 +15,10 @@ const db = admin.firestore();
 const ENV = {
   GOOGLE_SA_JSON: process.env.GOOGLE_SA_JSON,
   GOOGLE_ADMIN_SUBJECT: process.env.GOOGLE_ADMIN_SUBJECT,
-
-  // ✅ Cloud Run 서비스마다 이 값만 다르게 넣으면 됨
-  // 예:
-  // free-signup-tax      → GOOGLE_GROUP_EMAIL=tax-free@calvestor.com
-  // free-signup-semi     → GOOGLE_GROUP_EMAIL=semi-free@calvestor.com
-  // free-signup-visa     → GOOGLE_GROUP_EMAIL=visa-free@calvestor.com
-  GOOGLE_GROUP_EMAIL: process.env.GOOGLE_GROUP_EMAIL,
-
+  GOOGLE_GROUP_EMAIL: process.env.GOOGLE_GROUP_EMAIL, // free-subs@calvestor.com
   TURNSTILE_SECRET: process.env.TURNSTILE_SECRET,
 
-  // 예: "https://ihudson.mycafe24.com,https://calvestor.com"
+  // "https://ihudson.mycafe24.com,https://calvestor.com" 같은 형태
   ALLOWED_ORIGINS: (process.env.ALLOWED_ORIGINS || "")
     .split(",")
     .map((s) => s.trim())
@@ -33,15 +26,11 @@ const ENV = {
 
   RATE_IP_PER_HOUR: Number(process.env.RATE_IP_PER_HOUR || 20),
   RATE_EMAIL_PER_DAY: Number(process.env.RATE_EMAIL_PER_DAY || 3),
-
-  // 선택값: Cloud Run 서비스 구분용. 없어도 동작함.
-  SERVICE_NAME: process.env.SERVICE_NAME || "free-signup-api",
 };
 
 function must(name, v) {
   if (!v || String(v).trim() === "") throw new Error(`Missing env: ${name}`);
 }
-
 must("GOOGLE_SA_JSON", ENV.GOOGLE_SA_JSON);
 must("GOOGLE_ADMIN_SUBJECT", ENV.GOOGLE_ADMIN_SUBJECT);
 must("GOOGLE_GROUP_EMAIL", ENV.GOOGLE_GROUP_EMAIL);
@@ -56,6 +45,7 @@ function stripOuterQuotes(s) {
   return t;
 }
 
+// ✅ 프론트와 동일 레벨의 엄격한 이메일 정규식
 const EMAIL_REGEX =
   /^(?!.*\.\.)[A-Za-z0-9_%+-](?:[A-Za-z0-9._%+-]*[A-Za-z0-9_%+-])?@(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}$/;
 
@@ -125,15 +115,11 @@ async function verifyTurnstile(token, ip) {
 // ---------- Rate limit (Firestore) ----------
 async function rateLimitOrThrow({ ip, email }) {
   const now = new Date();
-
   const hourKey = `${now.getUTCFullYear()}-${now.getUTCMonth() + 1}-${now.getUTCDate()}-${now.getUTCHours()}`;
   const dayKey = `${now.getUTCFullYear()}-${now.getUTCMonth() + 1}-${now.getUTCDate()}`;
 
-  // ✅ 여러 무료 등록 서비스가 있어도 서로 rate limit이 섞이지 않게 group 기준 포함
-  const groupKey = ENV.GOOGLE_GROUP_EMAIL.toLowerCase();
-
-  const ipDocId = `group:${groupKey}:ip:${ip}:${hourKey}`;
-  const emDocId = `group:${groupKey}:email:${email}:${dayKey}`;
+  const ipDocId = `ip:${ip}:${hourKey}`;
+  const emDocId = `email:${email}:${dayKey}`;
 
   const ipRef = db.collection("rate_limits").doc(ipDocId);
   const emRef = db.collection("rate_limits").doc(emDocId);
@@ -147,32 +133,11 @@ async function rateLimitOrThrow({ ip, email }) {
     if (ipCount > ENV.RATE_IP_PER_HOUR) throw new Error("RATE_IP");
     if (emCount > ENV.RATE_EMAIL_PER_DAY) throw new Error("RATE_EMAIL");
 
-    const ttlIp = new Date(now.getTime() + 2 * 60 * 60 * 1000);
-    const ttlEm = new Date(now.getTime() + 2 * 24 * 60 * 60 * 1000);
+    const ttlIp = new Date(now.getTime() + 2 * 60 * 60 * 1000); // 2시간
+    const ttlEm = new Date(now.getTime() + 2 * 24 * 60 * 60 * 1000); // 2일
 
-    tx.set(
-      ipRef,
-      {
-        count: ipCount,
-        expireAt: ttlIp,
-        ip,
-        groupEmail: ENV.GOOGLE_GROUP_EMAIL,
-        serviceName: ENV.SERVICE_NAME,
-      },
-      { merge: true }
-    );
-
-    tx.set(
-      emRef,
-      {
-        count: emCount,
-        expireAt: ttlEm,
-        email,
-        groupEmail: ENV.GOOGLE_GROUP_EMAIL,
-        serviceName: ENV.SERVICE_NAME,
-      },
-      { merge: true }
-    );
+    tx.set(ipRef, { count: ipCount, expireAt: ttlIp, ip }, { merge: true });
+    tx.set(emRef, { count: emCount, expireAt: ttlEm, email }, { merge: true });
   });
 }
 
@@ -197,13 +162,7 @@ async function getDirectoryClient() {
   } catch (e) {
     const status = e?.response?.status;
     const data = e?.response?.data;
-    console.error("GOOGLE_AUTH_FAILED", {
-      status,
-      data,
-      message: String(e?.message || ""),
-      serviceName: ENV.SERVICE_NAME,
-      groupEmail: ENV.GOOGLE_GROUP_EMAIL,
-    });
+    console.error("GOOGLE_AUTH_FAILED", { status, data, message: String(e?.message || "") });
     throw new Error("GOOGLE_AUTH_FAILED");
   }
 
@@ -218,73 +177,36 @@ async function addToGroup(email) {
       groupKey: ENV.GOOGLE_GROUP_EMAIL,
       requestBody: { email, role: "MEMBER" },
     });
-
-    console.log("GROUP_MEMBER_ADDED", {
-      email,
-      groupEmail: ENV.GOOGLE_GROUP_EMAIL,
-      serviceName: ENV.SERVICE_NAME,
-    });
-
-    return {
-      added: true,
-      groupEmail: ENV.GOOGLE_GROUP_EMAIL,
-      serviceName: ENV.SERVICE_NAME,
-    };
+    return { added: true };
   } catch (e) {
-    const code = e?.code;
+    const code = e?.code; // usually HTTP status
     const msg = String(e?.message || "");
 
+    // already exists
     if (code === 409 || msg.includes("Member already exists") || msg.includes("duplicate")) {
-      console.log("GROUP_MEMBER_ALREADY_EXISTS", {
-        email,
-        groupEmail: ENV.GOOGLE_GROUP_EMAIL,
-        serviceName: ENV.SERVICE_NAME,
-      });
-
-      return {
-        added: false,
-        already: true,
-        groupEmail: ENV.GOOGLE_GROUP_EMAIL,
-        serviceName: ENV.SERVICE_NAME,
-      };
+      return { added: false, already: true };
     }
 
+    // ✅ 핵심: "없는 Gmail"은 404(Resource Not Found: <email>)로 떨어짐
+    // - 외부 도메인(네이버/아웃룩 등)은 초대 방식이라 대부분 404가 안 뜸
+    // - 404가 떠도 "email"이 메시지에 포함된 경우만 잡는다 (그룹 자체 404와 구분)
     if (
       code === 404 &&
       isGmailAddress(email) &&
       msg.toLowerCase().includes("resource not found") &&
       msg.toLowerCase().includes(String(email).toLowerCase())
     ) {
-      console.warn("EMAIL_NOT_FOUND_GMAIL", {
-        email,
-        code,
-        msg,
-        groupEmail: ENV.GOOGLE_GROUP_EMAIL,
-        serviceName: ENV.SERVICE_NAME,
-      });
+      console.warn("EMAIL_NOT_FOUND_GMAIL", { email, code, msg });
       throw new Error("EMAIL_NOT_FOUND");
     }
 
-    console.error("DIRECTORY_ERROR", {
-      code,
-      msg,
-      email,
-      groupEmail: ENV.GOOGLE_GROUP_EMAIL,
-      serviceName: ENV.SERVICE_NAME,
-    });
-
+    console.error("DIRECTORY_ERROR", { code, msg, email });
     throw new Error("DIRECTORY_ERROR");
   }
 }
 
 // ---------- routes ----------
-app.get("/health", (req, res) =>
-  res.json({
-    ok: true,
-    serviceName: ENV.SERVICE_NAME,
-    groupEmail: ENV.GOOGLE_GROUP_EMAIL,
-  })
-);
+app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.post("/api/free-signup", async (req, res) => {
   const ip = getClientIp(req);
@@ -299,29 +221,19 @@ app.post("/api/free-signup", async (req, res) => {
 
     const { ok: human, data } = await verifyTurnstile(token, ip);
     if (!human) {
-      console.warn("CAPTCHA_FAILED", {
-        ip,
-        email,
-        data,
-        groupEmail: ENV.GOOGLE_GROUP_EMAIL,
-        serviceName: ENV.SERVICE_NAME,
-      });
-
+      console.warn("CAPTCHA_FAILED", { ip, email, data });
       return res.status(403).json({ ok: false, code: "CAPTCHA_FAILED" });
     }
 
     const result = await addToGroup(email);
-
-    return res.json({
-      ok: true,
-      result,
-    });
+    return res.json({ ok: true, result });
   } catch (e) {
     const m = String(e?.message || "");
 
     if (m === "RATE_IP") return res.status(429).json({ ok: false, code: "RATE_IP" });
     if (m === "RATE_EMAIL") return res.status(429).json({ ok: false, code: "RATE_EMAIL" });
 
+    // ✅ 없는 Gmail 전용 코드
     if (m === "EMAIL_NOT_FOUND") {
       return res.status(404).json({ ok: false, code: "EMAIL_NOT_FOUND" });
     }
@@ -329,30 +241,17 @@ app.post("/api/free-signup", async (req, res) => {
     if (m.startsWith("BAD_GOOGLE_ADMIN_SUBJECT:")) {
       return res.status(500).json({ ok: false, code: "BAD_GOOGLE_ADMIN_SUBJECT" });
     }
-
     if (m === "GOOGLE_AUTH_FAILED") {
       return res.status(500).json({ ok: false, code: "GOOGLE_AUTH_FAILED" });
     }
-
     if (m === "DIRECTORY_ERROR") {
       return res.status(500).json({ ok: false, code: "DIRECTORY_ERROR" });
     }
 
-    console.error("free-signup error", {
-      message: m,
-      error: e,
-      groupEmail: ENV.GOOGLE_GROUP_EMAIL,
-      serviceName: ENV.SERVICE_NAME,
-    });
-
+    console.error("free-signup error", e);
     return res.status(500).json({ ok: false, code: "SERVER_ERROR" });
   }
 });
 
 const port = process.env.PORT || 8080;
-app.listen(port, () =>
-  console.log(`Listening on ${port}`, {
-    serviceName: ENV.SERVICE_NAME,
-    groupEmail: ENV.GOOGLE_GROUP_EMAIL,
-  })
-);
+app.listen(port, () => console.log(`Listening on ${port}`));
