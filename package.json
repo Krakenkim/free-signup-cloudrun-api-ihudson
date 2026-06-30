@@ -1,5 +1,5 @@
 {
-  "name": "google-group-free-signup-api",
+  "name": "free-signup-cloudrun-api-ihudson",
   "type": "module",
   "main": "index.js",
   "engines": {
